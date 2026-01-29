@@ -8,8 +8,15 @@ import pathlib
 
 import pytest
 
+import oras.client
+import oras.provider
 import oras.utils as utils
-from oras.utils.layout import get_ordered_blobs, is_oci_layout, validate_oci_layout
+from oras.utils.layout import (
+    get_ordered_blobs,
+    is_oci_layout,
+    push_from_layout,
+    validate_oci_layout,
+)
 
 
 def test_validate_oci_layout_valid_minimal(tmp_path):
@@ -625,3 +632,97 @@ def test_get_ordered_blobs_invalid_layout(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         get_ordered_blobs(str(invalid_layout))
+
+
+@pytest.mark.with_auth(False)
+def test_push_from_layout_single_arch(tmp_path, registry, credentials, target_layout_single):
+    """
+    Test pushing single-arch OCI layout to registry and verifying by pull.
+    Requires running registry (ORAS_HOST and ORAS_PORT environment variables).
+    """
+    # Get path to test data
+    layout_path = str(pathlib.Path(__file__).parent / "ocilayout_data/ocilayout1")
+
+    # Create provider and push layout
+    provider = oras.provider.Registry(insecure=True)
+    response = push_from_layout(
+        provider=provider,
+        target=target_layout_single,
+        layout_path=layout_path,
+        tag="latest"
+    )
+
+    # Verify push succeeded
+    assert response.status_code in [200, 201], f"Push failed with status {response.status_code}"
+
+    # Verify by pulling back using OrasClient
+    client = oras.client.OrasClient(hostname=registry, insecure=True)
+
+    # Pull the manifest to verify it exists
+    # We can't directly pull the whole layout structure, but we can verify the manifest exists
+    # by attempting to get tags or pull content
+    tags = client.get_tags(target_layout_single.rsplit(':', 1)[0])
+    assert "v1" in tags, "Pushed tag not found in registry"
+
+
+@pytest.mark.with_auth(False)
+def test_push_from_layout_multi_arch(tmp_path, registry, credentials, target_layout_multi, caplog):
+    """
+    Test pushing multi-arch OCI layout (with image index) to registry.
+    Also verifies that shared blobs are only uploaded once (deduplication).
+    Requires running registry (ORAS_HOST and ORAS_PORT environment variables).
+    """
+    import logging
+
+    # Get path to test data
+    layout_path = str(pathlib.Path(__file__).parent / "ocilayout_data/ocilayout2")
+
+    # Enable debug logging to track blob uploads
+    caplog.set_level(logging.DEBUG)
+
+    # Create provider and push layout
+    provider = oras.provider.Registry(insecure=True)
+    response = push_from_layout(
+        provider=provider,
+        target=target_layout_multi,
+        layout_path=layout_path,
+        tag="latest"
+    )
+
+    # Verify push succeeded
+    assert response.status_code in [200, 201], f"Push failed with status {response.status_code}"
+
+    # Verify by pulling back using OrasClient
+    client = oras.client.OrasClient(hostname=registry, insecure=True)
+
+    # Pull the manifest to verify it exists
+    tags = client.get_tags(target_layout_multi.rsplit(':', 1)[0])
+    assert "v1" in tags, "Pushed tag not found in registry"
+
+    # Verify deduplication: shared layer should appear at most once in upload logs
+    log_messages = [record.message for record in caplog.records]
+    shared_layer = "sha256:f64d04d7dad53e091bf339798f95eb0962ab0452f68156304eb90160e8f39f71"
+    upload_logs = [msg for msg in log_messages if shared_layer in msg and "Uploading" in msg]
+
+    # Should appear at most once (or 0 if blob already exists from previous test)
+    assert len(upload_logs) <= 1, f"Shared blob should be uploaded at most once, found {len(upload_logs)}"
+
+
+@pytest.mark.with_auth(False)
+def test_push_from_layout_invalid_tag(registry, credentials):
+    """
+    Test error handling when pushing with non-existent tag from layout.
+    """
+    layout_path = str(pathlib.Path(__file__).parent / "ocilayout_data/ocilayout1")
+    target = f"{registry}/dinosaur/layout-error:v1"
+
+    provider = oras.provider.Registry(insecure=True)
+
+    # Try to push with non-existent tag from layout
+    with pytest.raises(ValueError, match="Tag 'nonexistent' not found"):
+        push_from_layout(
+            provider=provider,
+            target=target,
+            layout_path=layout_path,
+            tag="nonexistent"  # This tag doesn't exist in ocilayout1's index.json
+        )

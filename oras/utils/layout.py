@@ -6,9 +6,11 @@ import json
 import pathlib
 from typing import TYPE_CHECKING
 
+import jsonschema
 import requests
 
 import oras.defaults
+import oras.schemas
 from oras.logger import logger
 from oras.utils.fileio import read_json
 
@@ -19,7 +21,6 @@ if TYPE_CHECKING:
 OCI_LAYOUT_FILE = "oci-layout"
 OCI_LAYOUT_VERSION_PIN = "1.0.0"
 OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
-OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
 OCI_INDEX_SCHEMA_VERSION = 2
 OCI_BLOBS_DIR = "blobs"
 OCI_REF_NAME_ANNOTATION = "org.opencontainers.image.ref.name"
@@ -267,7 +268,7 @@ def _process_manifest(
     manifest = read_json(str(blob_path))
     media_type = manifest.get("mediaType", "")
 
-    if media_type == OCI_MANIFEST_MEDIA_TYPE:
+    if media_type == oras.defaults.default_manifest_media_type:
         # Image manifest: layers -> config -> manifest
         for layer in manifest.get("layers", []):
             layer_digest = layer["digest"]
@@ -292,7 +293,7 @@ def _process_manifest(
     else:
         raise ValueError(
             f"Unsupported manifest mediaType: {media_type}. "
-            f"Expected '{OCI_MANIFEST_MEDIA_TYPE}' or '{OCI_INDEX_MEDIA_TYPE}'"
+            f"Expected '{oras.defaults.default_manifest_media_type}' or '{OCI_INDEX_MEDIA_TYPE}'"
         )
 
 
@@ -364,10 +365,16 @@ def push_from_layout(
     layout_path = validate_oci_layout(layout_path)
     layout_dir = pathlib.Path(layout_path)
 
+    # Validate target includes a tag
+    if ":" not in target or target.endswith(":"):
+        raise ValueError(
+            f"Target must include a tag in format 'registry/repository:tag', got: {target}"
+        )
+
     # Parse container from target
     container = provider.get_container(target)
 
-    # Get ordered blobs (layers -> config -> manifest -> index)
+    # Get ordered blobs: layers -> config -> manifest -> (optional) index
     ordered_blobs = get_ordered_blobs(layout_path, tag)
 
     logger.debug(f"Pushing {len(ordered_blobs)} blobs from OCI layout to {target}")
@@ -375,7 +382,7 @@ def push_from_layout(
     # Upload each blob in dependency order
     last_response = None
 
-    for digest in ordered_blobs:
+    for i, digest in enumerate(ordered_blobs):
         # Convert digest to file path
         blob_path = _digest_to_blob_path(layout_dir, digest)
 
@@ -383,16 +390,40 @@ def push_from_layout(
         if not blob_path.exists():
             raise FileNotFoundError(f"Blob not found: {blob_path}")
 
+        # Check if this is the last blob (last one should be tagged on Push/upload/PUT)
+        is_last_blob = (i == len(ordered_blobs) - 1)
+
         # Read blob to check if it's JSON and get mediaType
         try:
-            blob_data = read_json(str(blob_path))
+            # Read raw bytes first to avoid reading file twice
+            with open(blob_path, 'rb') as f:
+                manifest_bytes = f.read()
+
+            # Parse JSON from bytes
+            blob_data = json.loads(manifest_bytes)
             media_type = blob_data.get("mediaType", "")
 
             # Check if it's a manifest or index
-            if media_type in [OCI_MANIFEST_MEDIA_TYPE, OCI_INDEX_MEDIA_TYPE]:
-                # Upload as manifest
-                logger.debug(f"Uploading manifest/index: {digest}")
-                response = provider.upload_manifest(blob_data, container)
+            if media_type in [oras.defaults.default_manifest_media_type, OCI_INDEX_MEDIA_TYPE]:
+                # Validate manifest against schema (only for manifests, not indexes)
+                # Indexes have a different schema (manifests array instead of config/layers)
+                if media_type == oras.defaults.default_manifest_media_type:
+                    jsonschema.validate(blob_data, schema=oras.schemas.manifest)
+
+                # Use manifest's own mediaType for Content-Type header (critical for indexes!)
+                content_type = blob_data.get("mediaType", oras.defaults.default_manifest_media_type)
+                headers = {"Content-Type": content_type}
+
+                if is_last_blob:
+                    # Final manifest/index - upload with tag
+                    logger.debug(f"Uploading manifest/index with tag: {digest}")
+                    url = f"{provider.prefix}://{container.manifest_url()}"
+                    response = provider.do_request(url, "PUT", headers=headers, data=manifest_bytes)
+                else:
+                    # Intermediate manifest - upload by digest only (no tag)
+                    logger.debug(f"Uploading intermediate manifest by digest: {digest}")
+                    url = f"{provider.prefix}://{container.registry}/v2/{container.api_prefix}/manifests/{digest}"
+                    response = provider.do_request(url, "PUT", headers=headers, data=manifest_bytes)
             else:
                 # It's JSON but not a manifest (likely a config)
                 # Upload as blob with layer dict
@@ -411,7 +442,7 @@ def push_from_layout(
                 str(blob_path), container, layer, do_chunked, chunk_size
             )
 
-        # Check response status
+        # Check response status per ORAS-py conventions
         provider._check_200_response(response)
         last_response = response
 
