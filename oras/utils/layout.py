@@ -4,9 +4,16 @@ __license__ = "Apache-2.0"
 
 import json
 import pathlib
+from typing import TYPE_CHECKING
+
+import requests
 
 import oras.defaults
+from oras.logger import logger
 from oras.utils.fileio import read_json
+
+if TYPE_CHECKING:
+    from oras.provider import Registry
 
 # Constants for OCI layout validation
 OCI_LAYOUT_FILE = "oci-layout"
@@ -287,3 +294,126 @@ def _process_manifest(
             f"Unsupported manifest mediaType: {media_type}. "
             f"Expected '{OCI_MANIFEST_MEDIA_TYPE}' or '{OCI_INDEX_MEDIA_TYPE}'"
         )
+
+
+def _digest_to_blob_path(layout_dir: pathlib.Path, digest: str) -> pathlib.Path:
+    """
+    Convert digest string to blob file path in OCI layout.
+
+    :param layout_dir: path to OCI layout directory
+    :type layout_dir: pathlib.Path
+    :param digest: digest with algorithm prefix (e.g., "sha256:abc123...")
+    :type digest: str
+    :return: path to blob file (e.g., layout_dir/blobs/sha256/abc123...)
+    :rtype: pathlib.Path
+    """
+    algorithm, hash_value = digest.split(":", 1)
+    return layout_dir / OCI_BLOBS_DIR / algorithm / hash_value
+
+
+def _create_layer_dict(blob_path: pathlib.Path, digest: str, media_type: str) -> dict:
+    """
+    Create a layer dict for upload_blob from blob file.
+
+    :param blob_path: path to blob file
+    :type blob_path: pathlib.Path
+    :param digest: digest with algorithm prefix
+    :type digest: str
+    :param media_type: media type for the blob
+    :type media_type: str
+    :return: layer dict with digest, size, mediaType
+    :rtype: dict
+    """
+    size = blob_path.stat().st_size
+    return {
+        "digest": digest,
+        "size": size,
+        "mediaType": media_type or oras.defaults.unknown_config_media_type,
+    }
+
+
+def push_from_layout(
+    provider: "Registry",
+    target: str,
+    layout_path: str,
+    tag: str = "latest",
+    do_chunked: bool = False,
+    chunk_size: int = oras.defaults.default_chunksize,
+) -> requests.Response:
+    """
+    Push an OCI layout to a remote registry.
+
+    :param provider: Registry provider instance for uploading
+    :type provider: oras.provider.Registry
+    :param target: target registry/repository with destination tag (e.g., "ghcr.io/user/repo:v1.0")
+    :type target: str
+    :param layout_path: path to OCI layout directory
+    :type layout_path: str
+    :param tag: source tag to read from the layout's index.json annotations (default: "latest")
+    :type tag: str
+    :param do_chunked: use chunked upload for large blobs
+    :type do_chunked: bool
+    :param chunk_size: chunk size for chunked uploads
+    :type chunk_size: int
+    :return: response from the final manifest upload
+    :rtype: requests.Response
+    :raises FileNotFoundError: if layout or blobs don't exist
+    :raises ValueError: if layout is invalid or tag not found
+    """
+    # Validate and normalize path
+    layout_path = validate_oci_layout(layout_path)
+    layout_dir = pathlib.Path(layout_path)
+
+    # Parse container from target
+    container = provider.get_container(target)
+
+    # Get ordered blobs (layers -> config -> manifest -> index)
+    ordered_blobs = get_ordered_blobs(layout_path, tag)
+
+    logger.debug(f"Pushing {len(ordered_blobs)} blobs from OCI layout to {target}")
+
+    # Upload each blob in dependency order
+    last_response = None
+
+    for digest in ordered_blobs:
+        # Convert digest to file path
+        blob_path = _digest_to_blob_path(layout_dir, digest)
+
+        # Verify blob exists
+        if not blob_path.exists():
+            raise FileNotFoundError(f"Blob not found: {blob_path}")
+
+        # Read blob to check if it's JSON and get mediaType
+        try:
+            blob_data = read_json(str(blob_path))
+            media_type = blob_data.get("mediaType", "")
+
+            # Check if it's a manifest or index
+            if media_type in [OCI_MANIFEST_MEDIA_TYPE, OCI_INDEX_MEDIA_TYPE]:
+                # Upload as manifest
+                logger.debug(f"Uploading manifest/index: {digest}")
+                response = provider.upload_manifest(blob_data, container)
+            else:
+                # It's JSON but not a manifest (likely a config)
+                # Upload as blob with layer dict
+                logger.debug(f"Uploading config blob: {digest}")
+                layer = _create_layer_dict(blob_path, digest, media_type)
+                response = provider.upload_blob(
+                    str(blob_path), container, layer, do_chunked, chunk_size
+                )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Not JSON - must be a binary layer blob
+            logger.debug(f"Uploading layer blob: {digest}")
+            layer = _create_layer_dict(
+                blob_path, digest, oras.defaults.default_blob_media_type
+            )
+            response = provider.upload_blob(
+                str(blob_path), container, layer, do_chunked, chunk_size
+            )
+
+        # Check response status
+        provider._check_200_response(response)
+        last_response = response
+
+    logger.debug(f"Successfully pushed {len(ordered_blobs)} blobs to {target}")
+    return last_response
