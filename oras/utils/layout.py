@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 __author__ = "Matteo Mortari"
 __copyright__ = "Copyright The ORAS Authors."
 __license__ = "Apache-2.0"
@@ -334,7 +336,7 @@ def _create_layer_dict(blob_path: pathlib.Path, digest: str, media_type: str) ->
 
 
 def push_from_layout(
-    provider: "Registry",
+    provider: Registry,
     target: str,
     layout_path: str,
     tag: str = "latest",
