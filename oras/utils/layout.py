@@ -6,13 +6,16 @@ import json
 import pathlib
 
 import oras.defaults
+from oras.utils.fileio import read_json
 
 # Constants for OCI layout validation
 OCI_LAYOUT_FILE = "oci-layout"
 OCI_LAYOUT_VERSION_PIN = "1.0.0"
 OCI_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+OCI_MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
 OCI_INDEX_SCHEMA_VERSION = 2
 OCI_BLOBS_DIR = "blobs"
+OCI_REF_NAME_ANNOTATION = "org.opencontainers.image.ref.name"
 
 
 def _validate_oci_layout_file(layout_dir: pathlib.Path) -> None:
@@ -100,15 +103,13 @@ def _validate_index_json(layout_dir: pathlib.Path) -> None:
             f"schemaVersion must be {OCI_INDEX_SCHEMA_VERSION}, got: {index_data['schemaVersion']}"
         )
 
-    # Validate mediaType
-    if "mediaType" not in index_data:
-        raise ValueError(
-            f"File '{oras.defaults.oci_image_index_file}' must contain 'mediaType' property"
-        )
-    if index_data["mediaType"] != OCI_INDEX_MEDIA_TYPE:
-        raise ValueError(
-            f"mediaType must be '{OCI_INDEX_MEDIA_TYPE}', got: {index_data['mediaType']}"
-        )
+    # Validate mediaType (optional, but must be correct when present)
+    # Per OCI spec: SHOULD be used, and when used MUST be application/vnd.oci.image.index.v1+json
+    if "mediaType" in index_data:
+        if index_data["mediaType"] != OCI_INDEX_MEDIA_TYPE:
+            raise ValueError(
+                f"mediaType must be '{OCI_INDEX_MEDIA_TYPE}', got: {index_data['mediaType']}"
+            )
 
 
 def _validate_blobs_directory(layout_dir: pathlib.Path) -> None:
@@ -187,3 +188,102 @@ def is_oci_layout(path: str) -> bool:
         return True
     except (FileNotFoundError, ValueError, OSError):
         return False
+
+
+def get_ordered_blobs(layout_path: str, tag: str = "latest") -> list[str]:
+    """
+    Traverse an OCI layout and collect blob digests in dependency order for pushing.
+
+    Returns digests with algorithm prefix (e.g., "sha256:...") in the order:
+    - Layer blobs (bottom to top)
+    - Config blob
+    - Manifest blob(s)
+    - Index blob (if multi-arch)
+
+    :param layout_path: path to OCI layout directory
+    :type layout_path: str
+    :param tag: tag to look up in annotations (default: "latest")
+    :type tag: str
+    :return: list of digest strings including algorithm prefix
+    :rtype: list[str]
+    :raises FileNotFoundError: if layout, index, or blob files don't exist
+    :raises ValueError: if tag annotation not found or invalid structure
+    """
+    # Validate and normalize path
+    layout_path = validate_oci_layout(layout_path)
+    layout_dir = pathlib.Path(layout_path)
+
+    # Read index.json
+    index_file = layout_dir / oras.defaults.oci_image_index_file
+    index_data = read_json(str(index_file))
+
+    # Find manifest with matching tag annotation
+    target_digest = None
+    for manifest_entry in index_data.get("manifests", []):
+        annotations = manifest_entry.get("annotations", {})
+        if annotations.get(OCI_REF_NAME_ANNOTATION) == tag:
+            target_digest = manifest_entry["digest"]
+            break
+
+    if not target_digest:
+        raise ValueError(f"Tag '{tag}' not found in index")
+
+    # Collect blobs in dependency order
+    collected = []
+    _process_manifest(layout_dir, target_digest, collected)
+    return collected
+
+
+def _process_manifest(
+    layout_dir: pathlib.Path, digest: str, collected: list[str]
+) -> None:
+    """
+    Recursively process a manifest blob and collect dependencies.
+
+    :param layout_dir: path to OCI layout directory
+    :type layout_dir: pathlib.Path
+    :param digest: digest of manifest to process (with algorithm prefix)
+    :type digest: str
+    :param collected: list to accumulate digests (mutated in place)
+    :type collected: list[str]
+    :raises FileNotFoundError: if blob file doesn't exist
+    :raises ValueError: if manifest structure is invalid
+    """
+    # Construct blob path: blobs/sha256/abc123...
+    algorithm, hash_value = digest.split(":", 1)
+    blob_path = layout_dir / OCI_BLOBS_DIR / algorithm / hash_value
+
+    if not blob_path.exists():
+        raise FileNotFoundError(f"Blob not found: {blob_path}")
+
+    # Read manifest blob
+    manifest = read_json(str(blob_path))
+    media_type = manifest.get("mediaType", "")
+
+    if media_type == OCI_MANIFEST_MEDIA_TYPE:
+        # Image manifest: layers -> config -> manifest
+        for layer in manifest.get("layers", []):
+            layer_digest = layer["digest"]
+            if layer_digest not in collected:
+                collected.append(layer_digest)
+
+        config_digest = manifest.get("config", {}).get("digest")
+        if config_digest and config_digest not in collected:
+            collected.append(config_digest)
+
+        if digest not in collected:
+            collected.append(digest)
+
+    elif media_type == OCI_INDEX_MEDIA_TYPE:
+        # Image index: recurse on sub-manifests, then add index
+        for sub_manifest in manifest.get("manifests", []):
+            _process_manifest(layout_dir, sub_manifest["digest"], collected)
+
+        if digest not in collected:
+            collected.append(digest)
+
+    else:
+        raise ValueError(
+            f"Unsupported manifest mediaType: {media_type}. "
+            f"Expected '{OCI_MANIFEST_MEDIA_TYPE}' or '{OCI_INDEX_MEDIA_TYPE}'"
+        )

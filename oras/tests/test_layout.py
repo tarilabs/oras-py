@@ -4,11 +4,12 @@ __license__ = "Apache-2.0"
 
 import json
 import os
+import pathlib
 
 import pytest
 
 import oras.utils as utils
-from oras.utils.layout import is_oci_layout, validate_oci_layout
+from oras.utils.layout import get_ordered_blobs, is_oci_layout, validate_oci_layout
 
 
 def test_validate_oci_layout_valid_minimal(tmp_path):
@@ -351,8 +352,8 @@ def test_validate_oci_layout_wrong_schemaVersion(tmp_path):
     assert "2" in str(exc_info.value)
 
 
-def test_validate_oci_layout_missing_mediaType(tmp_path):
-    """Test validation fails when mediaType property is missing"""
+def test_validate_oci_layout_without_mediaType(tmp_path):
+    """Test validation succeeds when mediaType property is missing (it's optional per spec)"""
     layout_dir = tmp_path / "layout"
     layout_dir.mkdir()
 
@@ -362,13 +363,12 @@ def test_validate_oci_layout_missing_mediaType(tmp_path):
     oci_layout = {"imageLayoutVersion": "1.0.0"}
     utils.write_json(oci_layout, str(layout_dir / "oci-layout"))
 
-    # Create index.json without mediaType
+    # Create index.json without mediaType (this is valid per OCI spec)
     index = {"schemaVersion": 2}
     utils.write_json(index, str(layout_dir / "index.json"))
 
-    with pytest.raises(ValueError) as exc_info:
-        validate_oci_layout(str(layout_dir))
-    assert "mediaType" in str(exc_info.value)
+    result = validate_oci_layout(str(layout_dir))
+    assert result == str(layout_dir.resolve())
 
 
 def test_validate_oci_layout_wrong_mediaType(tmp_path):
@@ -566,3 +566,62 @@ def test_is_oci_layout_returns_false_for_missing_blobs(tmp_path):
     # Don't create blobs directory
 
     assert is_oci_layout(str(layout_dir)) is False
+
+
+def test_get_ordered_blobs_single_arch():
+    """Test blob ordering for single-arch image"""
+    layout_path = str(pathlib.Path(__file__).parent / "ocilayout_data/ocilayout1")
+    blobs = get_ordered_blobs(layout_path, "latest")
+
+    # Assert exact order: layer → config → manifest
+    assert blobs == [
+        "sha256:f64d04d7dad53e091bf339798f95eb0962ab0452f68156304eb90160e8f39f71",  # layer
+        "sha256:727164e7c96b89db7c1f62775f4d276dfac14a1c2ff7255b6512cf45d4c945af",  # config
+        "sha256:30d54aded8cf3cd575a96af152de0a4f13be8c098e59f0f165dba887c531ea9b",  # manifest
+    ]
+    assert len(blobs) == 3
+
+
+def test_get_ordered_blobs_multi_arch():
+    """Test blob ordering for multi-arch image index"""
+    layout_path = str(pathlib.Path(__file__).parent / "ocilayout_data/ocilayout2")
+    blobs = get_ordered_blobs(layout_path, "latest")
+
+    # Assert exact order: amd64 (layer→config→manifest), arm64 (config→manifest), index
+    # Note: layer is shared between amd64 and arm64, so appears only once
+    assert blobs == [
+        "sha256:f64d04d7dad53e091bf339798f95eb0962ab0452f68156304eb90160e8f39f71",  # layer (shared)
+        "sha256:6166c2c8a5b8c052a9fd309f566cb4456f4342b7690184cff54c503521bb0831",  # config (amd64)
+        "sha256:2f4c23ce8166bf07119d0a0407e4e689e2d542109e9372e23f2ca9f4e6f1998b",  # manifest (amd64)
+        "sha256:727164e7c96b89db7c1f62775f4d276dfac14a1c2ff7255b6512cf45d4c945af",  # config (arm64)
+        "sha256:30d54aded8cf3cd575a96af152de0a4f13be8c098e59f0f165dba887c531ea9b",  # manifest (arm64)
+        "sha256:9f0304abf66344f086dc5b78556b3120f6cecab221bba1eaeeb1d5fc082c14d5",  # index
+    ]
+    assert len(blobs) == 6
+
+
+def test_get_ordered_blobs_deduplication():
+    """Test that shared blobs are not duplicated"""
+    layout_path = str(pathlib.Path(__file__).parent / "ocilayout_data/ocilayout2")
+    blobs = get_ordered_blobs(layout_path, "latest")
+
+    # Verify no duplicates
+    assert len(blobs) == len(set(blobs)), "Blobs should not contain duplicates"
+
+
+def test_get_ordered_blobs_tag_not_found():
+    """Test error when tag annotation is not found"""
+    layout_path = str(pathlib.Path(__file__).parent / "ocilayout_data/ocilayout1")
+
+    with pytest.raises(ValueError, match="Tag 'nonexistent' not found"):
+        get_ordered_blobs(layout_path, "nonexistent")
+
+
+def test_get_ordered_blobs_invalid_layout(tmp_path):
+    """Test error when layout is invalid"""
+    # Create an empty directory (not a valid OCI layout)
+    invalid_layout = tmp_path / "invalid"
+    invalid_layout.mkdir()
+
+    with pytest.raises(FileNotFoundError):
+        get_ordered_blobs(str(invalid_layout))
